@@ -1,10 +1,10 @@
 [package]
 name = "zed-al-language"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "AL language support for Zed"
 license = "MIT"
-repository = "https://github.com/Barne-B/zed-al-language"
+repository = "https://github.com/rznd/zed-al"
 publish = false
 
 [lib]

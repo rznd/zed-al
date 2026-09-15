@@ -1,0 +1,24 @@
+// Zed tasks for AL. Copy into ~/.config/zed/tasks.json (%APPDATA%\Zed\tasks.json on Windows)
+// or into <project>/.zed/tasks.json, and adjust the script path to where this repo lives.
+[
+  {
+    "label": "AL: Compile",
+    "command": "pwsh",
+    "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/git/zed-al/scripts/al-compile.ps1", "-Path", "$ZED_FILE"],
+    "reveal": "always",
+    "hide": "never",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "tags": ["al"]
+  },
+  {
+    "label": "AL: Compile (no analyzers)",
+    "command": "pwsh",
+    "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/git/zed-al/scripts/al-compile.ps1", "-Path", "$ZED_FILE", "-NoAnalyzers"],
+    "reveal": "always",
+    "hide": "never",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "tags": ["al"]
+  }
+]

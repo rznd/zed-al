@@ -2,6 +2,14 @@
 
 AL language support for [Zed](https://zed.dev), targeting Microsoft Dynamics 365 Business Central development.
 
+> Fork of [Barne-B/zed-al-language](https://github.com/Barne-B/zed-al-language) maintained by [rznd](https://github.com/rznd). Changes over upstream:
+>
+> - **Monorepo detection.** When the worktree root has no `app.json`, the adapter looks for `all.code-workspace`, `workspace.code-workspace` or `<folder>.code-workspace` at the root and starts ALTool with `--workspacefile`, so every app listed there is loaded (cross-app navigation works). `--packagecachepath` is only pinned for single-app worktrees or when configured; `--settingspath` falls back to the `.vscode/settings.json` of the first workspace folder that has one.
+> - **`AL: Compile` task.** Zed has no problems panel, so `scripts/al-compile.ps1` finds the `app.json` above the current file, applies analyzers, ruleset and package cache from that project's `.vscode/settings.json`, runs `al compile` and prints diagnostics as `file:line:col: severity CODE: message` (clickable in Zed's terminal). See `tasks.example.json`; copy it to `%APPDATA%\Zed	asks.json` (Windows) or `~/.config/zed/tasks.json` and fix the script path.
+> - `.dal` files, block comments and bracket pairs in the language config.
+>
+> Install as a dev extension: `zed: install dev extension` → select this folder. Requires Rust via rustup (on Windows without MSVC Build Tools: `rustup default stable-x86_64-pc-windows-gnu`). Zed adds the `wasm32-wasip*` target and downloads the wasi-sdk for the tree-sitter grammar itself.
+
 This extension provides:
 
 - `.al` file detection.

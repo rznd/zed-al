@@ -6,6 +6,9 @@ const DEFAULT_BINARY_NAME: &str = "al";
 const FALLBACK_BINARY_NAME: &str = "altool";
 const DEFAULT_PACKAGE_CACHE_PATH: &str = ".alpackages";
 const DEFAULT_SETTINGS_PATH: &str = ".vscode/settings.json";
+const APP_MANIFEST: &str = "app.json";
+/// Workspace files tried, in order, when the worktree root is not itself an AL app.
+const WORKSPACE_FILE_CANDIDATES: &[&str] = &["all.code-workspace", "workspace.code-workspace"];
 const NEXT_ID_COMMAND: &str = "al-next-id";
 const COMPLETION_PROXY_SCRIPT_REL: &str = "scripts/al-lsp-proxy.js";
 const COMPLETION_PROXY_SCRIPT_NAME: &str = "al-lsp-proxy.js";
@@ -52,40 +55,76 @@ impl AlExtension {
 
         let mut args = vec!["launchlspserver".to_string()];
         let projects = setting_strings(settings, &["projects", "projectPaths", "project_paths"]);
+        let explicit_workspace_file =
+            setting_string(settings, &["workspaceFile", "workspace_file"]);
+        let root_is_project = worktree.read_text_file(APP_MANIFEST).is_ok();
 
-        if projects.is_empty() {
-            args.push(worktree.root_path());
-        } else {
+        // Where the AL projects are, in order of preference:
+        // 1. `projects` setting            — explicit list of app folders;
+        // 2. `workspaceFile` setting       — a .code-workspace whose folders are the apps;
+        // 3. app.json at the worktree root — a single-app worktree;
+        // 4. a .code-workspace at the root — a monorepo like locbr/all.code-workspace;
+        // 5. the worktree root itself      — ALTool's own default.
+        let mut workspace_file = explicit_workspace_file
+            .as_deref()
+            .map(|path| resolve_worktree_path(worktree, path));
+
+        if !projects.is_empty() {
             args.extend(
                 projects
                     .into_iter()
                     .map(|project| resolve_worktree_path(worktree, &project)),
             );
+        } else if workspace_file.is_some() {
+        } else if root_is_project {
+            args.push(worktree.root_path());
+        } else if let Some(found) = discover_workspace_file(worktree) {
+            workspace_file = Some(resolve_worktree_path(worktree, &found));
+        } else {
+            args.push(worktree.root_path());
         }
 
-        let package_cache_path = setting_path_list(
+        // Only pin the symbol cache when it is configured or when the worktree is one app; in a
+        // multi-app workspace every project defaults to its own .alpackages.
+        let configured_cache = setting_path_list(
             settings,
             &[
                 "packageCachePath",
                 "packageCachePaths",
                 "package_cache_path",
             ],
-        )
-        .unwrap_or_else(|| join_paths(&worktree.root_path(), DEFAULT_PACKAGE_CACHE_PATH));
+        );
+        let package_cache_path = match configured_cache {
+            Some(path) => Some(path),
+            None if root_is_project => Some(join_paths(
+                &worktree.root_path(),
+                DEFAULT_PACKAGE_CACHE_PATH,
+            )),
+            None => None,
+        };
+        if let Some(package_cache_path) = package_cache_path {
+            args.push("--packagecachepath".to_string());
+            args.push(package_cache_path);
+        }
 
-        args.push("--packagecachepath".to_string());
-        args.push(package_cache_path);
-
+        // ALTool only auto-discovers `.vscode/settings.json` under the LSP root, which in a
+        // multi-app worktree is the monorepo root. Fall back to the first app of the workspace
+        // that has one, so analyzers and ruleset still reach the server.
         if let Some(settings_path) = setting_string(settings, &["settingsPath", "settings_path"]) {
             args.push("--settingspath".to_string());
             args.push(settings_path);
         } else if worktree.read_text_file(DEFAULT_SETTINGS_PATH).is_ok() {
             args.push("--settingspath".to_string());
             args.push(resolve_worktree_path(worktree, DEFAULT_SETTINGS_PATH));
+        } else if let Some(found) = workspace_file
+            .as_deref()
+            .and_then(|path| first_workspace_settings_file(worktree, path))
+        {
+            args.push("--settingspath".to_string());
+            args.push(found);
         }
 
-        if let Some(workspace_file) = setting_string(settings, &["workspaceFile", "workspace_file"])
-        {
+        if let Some(workspace_file) = workspace_file {
             args.push("--workspacefile".to_string());
             args.push(workspace_file);
         }
@@ -666,6 +705,49 @@ fn setting_path_list(settings: &LspSettings, keys: &[&str]) -> Option<String> {
     } else {
         Some(paths.join(";"))
     }
+}
+
+/// The extension cannot list directories, so a monorepo is recognised by a `.code-workspace`
+/// file at the root: a well-known name first, then `<root folder name>.code-workspace`.
+fn discover_workspace_file(worktree: &zed::Worktree) -> Option<String> {
+    let root = worktree.root_path();
+    let root_name = root
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let named = format!("{root_name}.code-workspace");
+
+    WORKSPACE_FILE_CANDIDATES
+        .iter()
+        .map(|candidate| (*candidate).to_string())
+        .chain(std::iter::once(named))
+        .find(|candidate| {
+            !candidate.starts_with(".code-workspace") && worktree.read_text_file(candidate).is_ok()
+        })
+}
+
+/// `.vscode/settings.json` of the first folder listed in a `.code-workspace` file that has one.
+/// `workspace_file` is absolute; the worktree API only reads worktree-relative paths, so the
+/// file is re-read by its relative name.
+fn first_workspace_settings_file(worktree: &zed::Worktree, workspace_file: &str) -> Option<String> {
+    let root = worktree.root_path();
+    let relative = workspace_file
+        .strip_prefix(root.as_str())
+        .map(|rest| rest.trim_start_matches(['/', '\\']).to_string())
+        .unwrap_or_else(|| workspace_file.to_string());
+    let content = worktree.read_text_file(&relative).ok()?;
+    let parsed: zed::serde_json::Value = zed::serde_json::from_str(&content).ok()?;
+
+    parsed
+        .get("folders")?
+        .as_array()?
+        .iter()
+        .filter_map(|folder| folder.get("path").and_then(|path| path.as_str()))
+        .map(|folder| join_paths(folder, DEFAULT_SETTINGS_PATH))
+        .find(|candidate| worktree.read_text_file(candidate).is_ok())
+        .map(|candidate| resolve_worktree_path(worktree, &candidate))
 }
 
 fn resolve_worktree_path(worktree: &zed::Worktree, path: &str) -> String {
