@@ -8,3 +8,6 @@
 Thumbs.db
 .vscode/
 .zed/
+
+# Zed dev extension build output
+/extension.wasm
