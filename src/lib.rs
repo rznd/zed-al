@@ -10,14 +10,24 @@ const APP_MANIFEST: &str = "app.json";
 /// Workspace files tried, in order, when the worktree root is not itself an AL app.
 const WORKSPACE_FILE_CANDIDATES: &[&str] = &["all.code-workspace", "workspace.code-workspace"];
 const NEXT_ID_COMMAND: &str = "al-next-id";
-const COMPLETION_PROXY_SCRIPT_REL: &str = "scripts/al-lsp-proxy.js";
-const COMPLETION_PROXY_SCRIPT_NAME: &str = "al-lsp-proxy.js";
-const EMBEDDED_COMPLETION_PROXY_SCRIPT: &str = include_str!("../scripts/al-lsp-proxy.js");
+const PROXY_SCRIPT_REL: &str = "scripts/al-lsp-proxy.js";
+const PROXY_SCRIPT_NAME: &str = "al-lsp-proxy.js";
+const EMBEDDED_PROXY_SCRIPT: &str = include_str!("../scripts/al-lsp-proxy.js");
+
+/// When the proxy compiles the project that owns a buffer and publishes the diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackgroundCodeAnalysis {
+    /// On save and when the first file of a project is opened (default).
+    Project,
+    /// Only on save.
+    Save,
+    Off,
+}
 
 struct AlExtension {
     /// Zed sets `PWD` to the extension working directory for WASM extensions.
     extension_work_dir: String,
-    completion_proxy_script_path: Option<String>,
+    proxy_script_path: Option<String>,
 }
 
 impl AlExtension {
@@ -159,34 +169,60 @@ impl AlExtension {
         env
     }
 
-    fn completion_proxy_script_path(&mut self) -> zed::Result<String> {
-        if let Some(path) = &self.completion_proxy_script_path {
+    fn proxy_script_path(&mut self) -> zed::Result<String> {
+        if let Some(path) = &self.proxy_script_path {
             return Ok(path.clone());
         }
 
-        let path = Self::resolve_completion_proxy_script_path(&self.extension_work_dir)?;
-        self.completion_proxy_script_path = Some(path.clone());
+        let path = Self::resolve_proxy_script_path(&self.extension_work_dir)?;
+        self.proxy_script_path = Some(path.clone());
         Ok(path)
     }
 
-    fn resolve_completion_proxy_script_path(extension_work_dir: &str) -> zed::Result<String> {
+    fn resolve_proxy_script_path(extension_work_dir: &str) -> zed::Result<String> {
         let extension_work_dir = extension_work_dir.trim();
 
         if extension_work_dir.is_empty() {
             return Err(
-                "Could not resolve the AL completion proxy script path (extension work directory is unavailable). Reinstall with `zed: install dev extension`.".to_string(),
+                "Could not resolve the AL LSP proxy script path (extension work directory is unavailable). Reinstall with `zed: install dev extension`.".to_string(),
             );
         }
 
-        let dev_script_path = join_paths(extension_work_dir, COMPLETION_PROXY_SCRIPT_REL);
+        let dev_script_path = join_paths(extension_work_dir, PROXY_SCRIPT_REL);
         if path_is_regular_file(&dev_script_path) {
             return Ok(dev_script_path);
         }
 
-        let materialized_path = join_paths(extension_work_dir, COMPLETION_PROXY_SCRIPT_NAME);
-        materialize_completion_proxy_script(&materialized_path)?;
+        let materialized_path = join_paths(extension_work_dir, PROXY_SCRIPT_NAME);
+        materialize_proxy_script(&materialized_path)?;
 
         Ok(materialized_path)
+    }
+
+    fn background_code_analysis(settings: &LspSettings) -> BackgroundCodeAnalysis {
+        let Some(value) = settings.settings.as_ref().and_then(|settings| {
+            ["backgroundCodeAnalysis", "background_code_analysis"]
+                .iter()
+                .find_map(|key| settings.get(*key))
+        }) else {
+            return BackgroundCodeAnalysis::Project;
+        };
+
+        if let Some(enabled) = value.as_bool() {
+            return if enabled {
+                BackgroundCodeAnalysis::Project
+            } else {
+                BackgroundCodeAnalysis::Off
+            };
+        }
+
+        match value.as_str().map(|mode| mode.trim().to_ascii_lowercase()) {
+            Some(mode) if mode == "off" || mode == "none" || mode == "false" => {
+                BackgroundCodeAnalysis::Off
+            }
+            Some(mode) if mode == "save" || mode == "file" => BackgroundCodeAnalysis::Save,
+            _ => BackgroundCodeAnalysis::Project,
+        }
     }
 }
 
@@ -196,19 +232,18 @@ fn path_is_regular_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn materialize_completion_proxy_script(path: &str) -> zed::Result<()> {
+fn materialize_proxy_script(path: &str) -> zed::Result<()> {
     if path_is_regular_file(path) {
-        let existing = std::fs::read_to_string(path).map_err(|error| {
-            format!("could not read AL completion proxy script at `{path}`: {error}")
-        })?;
+        let existing = std::fs::read_to_string(path)
+            .map_err(|error| format!("could not read AL LSP proxy script at `{path}`: {error}"))?;
 
-        if existing == EMBEDDED_COMPLETION_PROXY_SCRIPT {
+        if existing == EMBEDDED_PROXY_SCRIPT {
             return Ok(());
         }
     }
 
-    std::fs::write(path, EMBEDDED_COMPLETION_PROXY_SCRIPT).map_err(|error| {
-        format!("could not materialize AL completion proxy script at `{path}`: {error}")
+    std::fs::write(path, EMBEDDED_PROXY_SCRIPT).map_err(|error| {
+        format!("could not materialize AL LSP proxy script at `{path}`: {error}")
     })
 }
 
@@ -216,7 +251,7 @@ impl zed::Extension for AlExtension {
     fn new() -> Self {
         Self {
             extension_work_dir: std::env::var("PWD").unwrap_or_default(),
-            completion_proxy_script_path: None,
+            proxy_script_path: None,
         }
     }
 
@@ -236,9 +271,17 @@ impl zed::Extension for AlExtension {
         let args = Self::resolve_args(&settings, worktree);
         let env = Self::resolve_env(&settings, worktree);
 
-        if setting_bool(&settings, &["useCompletionProxy", "use_completion_proxy"]) {
-            let proxy_script_path = self.completion_proxy_script_path()?;
-            let mut proxy_args = vec![proxy_script_path, "--".to_string(), server_command];
+        // The proxy publishes diagnostics from `al compile` and fixes completion labels; both are
+        // lost when it is turned off.
+        if setting_bool_or(&settings, &["useProxy", "use_proxy"], true) {
+            let mut proxy_args = vec![self.proxy_script_path()?];
+            match Self::background_code_analysis(&settings) {
+                BackgroundCodeAnalysis::Project => {}
+                BackgroundCodeAnalysis::Save => proxy_args.push("--no-compile-on-open".to_string()),
+                BackgroundCodeAnalysis::Off => proxy_args.push("--no-diagnostics".to_string()),
+            }
+            proxy_args.push("--".to_string());
+            proxy_args.push(server_command);
             proxy_args.extend(args);
 
             return Ok(zed::Command {
@@ -654,17 +697,15 @@ fn setting_string(settings: &LspSettings, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn setting_bool(settings: &LspSettings, keys: &[&str]) -> bool {
-    let Some(settings) = settings.settings.as_ref() else {
-        return false;
-    };
-
-    keys.iter().any(|key| {
-        settings
-            .get(*key)
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-    })
+fn setting_bool_or(settings: &LspSettings, keys: &[&str], default: bool) -> bool {
+    settings
+        .settings
+        .as_ref()
+        .and_then(|settings| {
+            keys.iter()
+                .find_map(|key| settings.get(*key).and_then(|value| value.as_bool()))
+        })
+        .unwrap_or(default)
 }
 
 fn setting_strings(settings: &LspSettings, keys: &[&str]) -> Vec<String> {
@@ -779,7 +820,7 @@ fn join_paths(root: &str, path: &str) -> String {
 }
 
 #[cfg(test)]
-mod completion_proxy_tests {
+mod proxy_tests {
     use super::*;
     use std::fs;
 
@@ -798,7 +839,7 @@ mod completion_proxy_tests {
         let dev_script = scripts_dir.join("al-lsp-proxy.js");
         fs::write(&dev_script, "dev proxy script").expect("dev script should be written");
 
-        let resolved = AlExtension::resolve_completion_proxy_script_path(
+        let resolved = AlExtension::resolve_proxy_script_path(
             &work_dir.to_string_lossy(),
         )
         .expect("dev script path should resolve");
@@ -809,9 +850,9 @@ mod completion_proxy_tests {
     #[test]
     fn materializes_proxy_script_in_fake_work_dir() {
         let work_dir = temp_work_dir("materialize");
-        let expected_path = work_dir.join(COMPLETION_PROXY_SCRIPT_NAME);
+        let expected_path = work_dir.join(PROXY_SCRIPT_NAME);
 
-        let resolved = AlExtension::resolve_completion_proxy_script_path(
+        let resolved = AlExtension::resolve_proxy_script_path(
             &work_dir.to_string_lossy(),
         )
         .expect("materialized script path should resolve");
@@ -820,21 +861,21 @@ mod completion_proxy_tests {
         assert!(expected_path.is_file());
 
         let materialized = fs::read_to_string(&expected_path).expect("materialized script should be readable");
-        assert_eq!(materialized, EMBEDDED_COMPLETION_PROXY_SCRIPT);
+        assert_eq!(materialized, EMBEDDED_PROXY_SCRIPT);
     }
 
     #[test]
     fn skips_rewriting_materialized_script_when_unchanged() {
         let work_dir = temp_work_dir("unchanged");
-        let script_path = work_dir.join(COMPLETION_PROXY_SCRIPT_NAME);
-        fs::write(&script_path, EMBEDDED_COMPLETION_PROXY_SCRIPT)
+        let script_path = work_dir.join(PROXY_SCRIPT_NAME);
+        fs::write(&script_path, EMBEDDED_PROXY_SCRIPT)
             .expect("existing materialized script should be written");
         let modified = fs::metadata(&script_path)
             .expect("script metadata should exist")
             .modified()
             .expect("modified time should exist");
 
-        materialize_completion_proxy_script(&script_path.to_string_lossy())
+        materialize_proxy_script(&script_path.to_string_lossy())
             .expect("unchanged script should not be rewritten");
 
         assert_eq!(

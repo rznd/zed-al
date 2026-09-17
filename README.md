@@ -5,7 +5,8 @@ AL language support for [Zed](https://zed.dev), targeting Microsoft Dynamics 365
 > Fork of [Barne-B/zed-al-language](https://github.com/Barne-B/zed-al-language) maintained by [rznd](https://github.com/rznd). Changes over upstream:
 >
 > - **Monorepo detection.** When the worktree root has no `app.json`, the adapter looks for `all.code-workspace`, `workspace.code-workspace` or `<folder>.code-workspace` at the root and starts ALTool with `--workspacefile`, so every app listed there is loaded (cross-app navigation works). `--packagecachepath` is only pinned for single-app worktrees or when configured; `--settingspath` falls back to the `.vscode/settings.json` of the first workspace folder that has one.
-> - **`AL: Compile` task.** Zed has no problems panel, so `scripts/al-compile.ps1` finds the `app.json` above the current file, applies analyzers, ruleset and package cache from that project's `.vscode/settings.json`, runs `al compile` and prints diagnostics as `file:line:col: severity CODE: message` (clickable in Zed's terminal). See `tasks.example.json`; copy it to `%APPDATA%\Zed\tasks.json` (Windows) or `~/.config/zed/tasks.json` and fix the script path.
+> - **Background code analysis.** ALTool's `launchlspserver` never publishes diagnostics, so the extension launches it through a small stdio proxy (`scripts/al-lsp-proxy.js`, on Zed's Node runtime). On save, and when the first file of a project is opened, the proxy runs `al compile` for the app that owns the file, with the analyzers, ruleset and package cache from that app's `.vscode/settings.json`, and publishes the result as LSP diagnostics. Errors and warnings show up in the buffer and in Zed's project diagnostics panel. See [Background Code Analysis](#background-code-analysis).
+- **`AL: Compile` task.** Manual alternative to the above: `scripts/al-compile.ps1` finds the `app.json` above the current file, applies analyzers, ruleset and package cache from that project's `.vscode/settings.json`, runs `al compile` and prints diagnostics as `file:line:col: severity CODE: message` (clickable in Zed's terminal). See `tasks.example.json`; copy it to `%APPDATA%\Zed\tasks.json` (Windows) or `~/.config/zed/tasks.json` and fix the script path.
 > - `.dal` files, block comments and bracket pairs in the language config.
 >
 > Install as a dev extension: `zed: install dev extension` → select this folder. Requires Rust via rustup (on Windows without MSVC Build Tools: `rustup default stable-x86_64-pc-windows-gnu`). Zed adds the `wasm32-wasip*` target and downloads the wasi-sdk for the tree-sitter grammar itself.
@@ -15,6 +16,7 @@ This extension provides:
 - `.al` file detection.
 - Tree-sitter syntax highlighting, brackets, indentation, folding, and outline support via [`SShadowS/tree-sitter-al`](https://github.com/SShadowS/tree-sitter-al).
 - Language Server Protocol support through Microsoft ALTool's standalone LSP command.
+- Compiler and code analyzer diagnostics (errors, warnings, info) in the buffer and in the project diagnostics panel, compiled in the background on save.
 - Snippets for common AL objects and constructs.
 - A file-scoped slash command for finding next free AL IDs.
 
@@ -151,27 +153,42 @@ When `binary.arguments` is set, it replaces the default generated arguments.
 
 Semantic tokens are provided by ALTool when supported by the active language server. This extension does not add custom semantic token remapping, so highlighting remains driven by Tree-sitter plus the LSP capabilities reported by ALTool.
 
-### Completion Deserialization Errors
+### Background Code Analysis
 
-If Zed logs an error like `failed to deserialize response from language server: invalid type: map, expected a string` for a completion response containing `"label":{"label":"..."}`, the AL language server is returning a VS Code-style completion label object in the LSP `CompletionItem.label` field. Standard LSP requires `CompletionItem.label` to be a string; structured label metadata belongs in `CompletionItem.labelDetails`.
+ALTool's `launchlspserver` (18.0.41 at the time of writing) registers no diagnostics endpoint and never sends `textDocument/publishDiagnostics`, even with an error in the open file. It also ignores `al.backgroundCodeAnalysis` from `settings.json`. Zed extensions cannot produce diagnostics themselves, so the extension launches ALTool through `scripts/al-lsp-proxy.js`, a stdio proxy running on Zed's Node runtime (`node_binary_path`), and the proxy fills the gap:
 
-This is not caused by `snippets/al.json`, and it cannot be corrected by this extension's `label_for_completion` hook because Zed only calls that hook after completion items have already deserialized successfully. The current `zed_extension_api` lets this extension provide the language server command, initialization options, and workspace configuration, but it does not expose a hook to rewrite raw LSP responses or override Zed's LSP client capabilities.
+1. When Zed sends `textDocument/didSave` (or `textDocument/didOpen` for the first file of a project), the proxy walks up from the file to the nearest `app.json`.
+2. It reads that project's `.vscode/settings.json` (`al.packageCachePath`, `al.assemblyProbingPaths`, `al.ruleSetPath`, `al.codeAnalyzers` with the `${CodeCop}`, `${UICop}`, `${AppSourceCop}`, `${PerTenantExtensionCop}` and `${analyzerFolder}` tokens resolved against the ALTool tool store) and runs `al compile /project:<app> /parallel /errorlog:<tmp> /out:<tmp>`. The `.app` goes to the temp folder and is deleted afterwards.
+3. The error log is converted into one `publishDiagnostics` notification per file (severity, rule ID, message and help link). Files whose diagnostics disappeared get an empty list, so stale markers are cleared.
 
-As an opt-in workaround, the extension can launch ALTool through a small stdio proxy that rewrites completion responses before Zed deserializes them. The proxy preserves the normal ALTool arguments and only changes completion items whose `label` is an object, replacing it with `label.label` when present and falling back to `filterText`, `insertText`, or `detail`.
+Compiles for the same app are debounced and never overlap; a save during a compile queues one more run. Progress is reported through `window/workDoneProgress`, and a compile that fails without producing diagnostics (missing symbols, for instance) shows the compiler's last lines as a Zed notification. In a multi-app worktree each app is compiled on its own, exactly like VS Code's `al.backgroundCodeAnalysis: "Project"`.
+
+Limitations: only the saved state is analyzed, not the buffer being edited, and each run is a full compile of that app (about 16 s for a 400-object app with the three Microsoft analyzers; a few seconds for small apps). The `AL: Compile` task remains available as a manual alternative.
+
+Settings (under `lsp.al.settings`):
 
 ```json
 {
   "lsp": {
     "al": {
       "settings": {
-        "useCompletionProxy": true
+        "backgroundCodeAnalysis": "Project"
       }
     }
   }
 }
 ```
 
-The proxy uses Zed's Node runtime (`node_binary_path`, including Volta-managed installs on Windows) and launches `scripts/al-lsp-proxy.js` by absolute path from the extension working directory (`PWD`). The script ships in this repository next to `extension.wasm`; it is not embedded with `node -e` or `AL_LSP_PROXY_SCRIPT`. Optional `lsp.al.binary.env` entries are still forwarded when set, but the proxy does not depend on custom env vars reaching the LSP process. It is still a workaround: it only covers malformed completion responses, adds one local process between Zed and ALTool, and should be removed once ALTool or Zed handles the invalid response shape directly. If the proxy causes trouble, remove `useCompletionProxy` to return to the normal LSP path.
+- `backgroundCodeAnalysis`: `"Project"` (default) compiles on save and when the first file of an app is opened; `"Save"` compiles on save only; `"Off"` (or `false`) disables the background compile. The proxy is then launched with `--no-compile-on-open` or `--no-diagnostics`.
+- `useProxy`: set to `false` to launch ALTool directly, without the proxy. This also disables background code analysis and the completion fix below. Not needed with `binary.arguments`, which the proxy passes through unchanged.
+
+### Completion Deserialization Errors
+
+The AL language server returns VS Code-style completion label objects (`"label":{"label":"..."}`) in the LSP `CompletionItem.label` field, which Zed cannot deserialize (`failed to deserialize response from language server: invalid type: map, expected a string`). Standard LSP requires `CompletionItem.label` to be a string; structured label metadata belongs in `CompletionItem.labelDetails`.
+
+This is not caused by `snippets/al.json`, and it cannot be corrected by this extension's `label_for_completion` hook because Zed only calls that hook after completion items have already deserialized successfully. The same proxy that provides background code analysis rewrites completion items whose `label` is an object, replacing it with `label.label` when present and falling back to `filterText`, `insertText`, or `detail`, and moving `detail`/`description` into `labelDetails`. The rewrite should be removed once ALTool or Zed handles the invalid response shape directly.
+
+The script ships in this repository next to `extension.wasm`; when the extension is installed without the `scripts/` folder, the embedded copy is materialized into the extension working directory. Optional `lsp.al.binary.env` entries are still forwarded when set.
 
 ## Development
 
@@ -185,7 +202,7 @@ For local validation, open an AL project containing `app.json`, at least one `.a
 
 If the language server does not start, check Zed's log for missing `al`/`altool`, invalid package cache paths, or missing symbol packages.
 
-To smoke test the optional completion proxy without ALTool, run:
+To test the proxy (completion rewrite and background code analysis) without ALTool, run:
 
 ```sh
 node scripts/test-al-lsp-proxy.js
